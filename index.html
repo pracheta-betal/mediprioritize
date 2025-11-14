@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MediPrioritize - AI Medical Triage</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Lucide Icons (Corrected: 'lucide' instead of 'lucide-react') -->
+    <script src="https://unpkg.com/lucide@0.395.0/dist/lucide.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #dc3545;
+        }
+        
+        /* Simple loading spinner */
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border-left-color: #09f;
+            animation: spin 1s ease infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+
+    <!-- Firebase and Gemini API Module -->
+    <script type="module">
+        import { initializeApp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, setDoc, collection, query, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL STATE ---
+        let db, auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        // --- CONFIG (MUST be provided by the environment) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let firebaseConfig;
+        try {
+            firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+            if (!firebaseConfig.apiKey) {
+                console.warn("Firebase config is missing or invalid. Using mock data.");
+                setMockMode(true);
+            }
+        } catch (e) {
+            console.error("Failed to parse Firebase config:", e);
+            setMockMode(true);
+        }
+
+        // --- MOCK MODE (for environments without Firebase config) ---
+        let mockMode = false;
+        let mockTriageQueue = [
+            { id: 'm1', patientId: 'mock-user-1', symptoms: 'Severe chest pain, shortness of breath', priority: 5, rationale: 'Symptoms are indicative of a potential cardiac event.' },
+            { id: 'm2', patientId: 'mock-user-2', symptoms: 'Fever and cough for 3 days', priority: 2, rationale: 'Symptoms are consistent with a common cold or flu.' }
+        ];
+
+        function setMockMode(isMock) {
+            mockMode = isMock;
+            if (isMock) {
+                console.log("Running in Mock Mode. API and Firestore calls will be simulated.");
+                isAuthReady = true;
+                userId = 'mock-user-id-' + Math.random().toString(36).substring(7);
+                document.getElementById('patient-id-display').textContent = `Your Patient ID: ${userId}`;
+                renderTriageQueue(mockTriageQueue);
+            }
+        }
+
+        // --- 1. AUTHENTICATION ---
+        async function setupAuth() {
+            if (mockMode) return;
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug');
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        console.log("User authenticated:", userId);
+                        document.getElementById('patient-id-display').textContent = `Your Patient ID: ${userId}`;
+                        loadTriageQueue(); // Start listening for queue updates *after* auth is ready
+                    } else {
+                        // No user signed in.
+                        isAuthReady = false;
+                        userId = null;
+                    }
+                });
+
+                // Sign in
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase Auth Error:", error);
+                document.getElementById('api-message').innerHTML = `<div class="text-red-700 p-4 bg-red-100 rounded-lg">Firebase connection failed. Triage system is offline.</div>`;
+                setMockMode(true); // Fallback to mock mode if auth fails
+            }
+        }
+
+        // --- 2. TRIAGE QUEUE (FIRESTORE) ---
+
+        /**
+         * Loads the live triage queue from Firestore and listens for updates.
+         */
+        function loadTriageQueue() {
+            if (!isAuthReady || !db) {
+                console.log("Auth not ready or DB not initialized. Skipping queue load.");
+                return;
+            }
+
+            const collectionPath = `/artifacts/${appId}/public/data/triage-requests`;
+            const q = query(collection(db, collectionPath));
+
+            onSnapshot(q, (snapshot) => {
+                let requests = [];
+                snapshot.forEach((doc) => {
+                    requests.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Sort in JavaScript (descending priority)
+                requests.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+                
+                renderTriageQueue(requests);
+            }, (error) => {
+                console.error("Error listening to triage queue:", error);
+            });
+        }
+
+        /**
+         * Renders the array of requests into the DOM.
+         */
+        function renderTriageQueue(requests) {
+            const queueElement = document.getElementById('triage-queue-list');
+            if (!queueElement) return;
+
+            queueElement.innerHTML = ''; // Clear existing list
+
+            if (requests.length === 0) {
+                queueElement.innerHTML = `<li class="text-gray-500 p-4">No patients in the queue.</li>`;
+                return;
+            }
+
+            requests.forEach(req => {
+                const priorityClass = getPriorityClass(req.priority);
+                const li = document.createElement('li');
+                li.className = `bg-white p-4 rounded-lg shadow-sm border-l-4 ${priorityClass.border} flex flex-col md:flex-row md:items-center justify-between space-y-2 md:space-y-0`;
+                li.innerHTML = `
+                    <div class="flex-1">
+                        <div class="flex items-center space-x-2">
+                            <span class="font-bold text-lg ${priorityClass.text}">${getPriorityLabel(req.priority)} (Level ${req.priority})</span>
+                        </div>
+                        <p class="text-gray-800 mt-1"><span class="font-semibold">Symptoms:</span> ${req.symptoms.substring(0, 100)}${req.symptoms.length > 100 ? '...' : ''}</p>
+                        <p class="text-sm text-gray-600 mt-1"><span class="font-semibold">Rationale:</span> ${req.rationale}</p>
+                    </div>
+                    <div class="md:text-right">
+                        <span class="text-xs bg-gray-200 text-gray-700 px-2 py-1 rounded-full">Patient ID: ...${(req.patientId || 'N/A').slice(-6)}</span>
+                    </div>
+                `;
+                queueElement.appendChild(li);
+            });
+        }
+
+        /**
+         * Saves a new triage request to the Firestore database.
+         */
+        async function saveTriageRequest(symptoms, priority, rationale) {
+            if (mockMode) {
+                const newRequest = {
+                    id: 'm' + (mockTriageQueue.length + 1),
+                    patientId: userId,
+                    symptoms: symptoms,
+                    priority: priority,
+                    rationale: rationale,
+                    timestamp: new Date()
+                };
+                mockTriageQueue.push(newRequest);
+                renderTriageQueue(mockTriageQueue.sort((a, b) => (b.priority || 0) - (a.priority || 0)));
+                return;
+            }
+
+            if (!isAuthReady || !db || !userId) {
+                console.error("Cannot save request: Auth not ready, DB not init, or no User ID.");
+                return;
+            }
+
+            const collectionPath = `/artifacts/${appId}/public/data/triage-requests`;
+            try {
+                await addDoc(collection(db, collectionPath), {
+                    patientId: userId,
+                    symptoms: symptoms,
+                    priority: priority,
+                    rationale: rationale,
+                    timestamp: serverTimestamp()
+                });
+                console.log("Triage request saved.");
+            } catch (error) {
+                console.error("Error saving triage request:", error);
+            }
+        }
+
+        // --- 3. SYMPTOM ANALYSIS (GEMINI API) ---
+
+        /**
+         * Helper for exponential backoff on API calls.
+         */
+        async function fetchWithBackoff(apiUrl, payload, maxRetries = 3) {
+            let delay = 1000;
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        return await response.json();
+                    }
+                    
+                    if (response.status === 429 || response.status >= 500) {
+                        // Throttling or server error, wait and retry
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        delay *= 2; // Exponentially increase delay
+                    } else {
+                        // Don't retry for client-side errors (e.g., 400 Bad Request)
+                        return await response.json(); 
+                    }
+                } catch (error) {
+                    console.error("Fetch error:", error);
+                    if (i === maxRetries - 1) throw error; // Throw last error
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2;
+                }
+            }
+            throw new Error("API request failed after all retries.");
+        }
+
+
+        /**
+         * Calls the Gemini API to get a priority score for symptoms.
+         */
+        async function getTriagePriority(symptoms) {
+            if (mockMode) {
+                await new Promise(res => setTimeout(res, 1000)); // Simulate network delay
+                const mockPriority = Math.floor(Math.random() * 5) + 1;
+                return { 
+                    priority: mockPriority, 
+                    rationale: "This is a simulated AI rationale based on the symptoms provided." 
+                };
+            }
+
+            const apiKey = ""; // API key is handled by the environment
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const systemPrompt = "You are an AI medical triage assistant. Analyze the user's symptoms and return a priority level from 1 (Low) to 5 (Critical). 1 is non-urgent, 2 is mild, 3 is moderate, 4 is severe, and 5 is critical/life-threatening. Your response MUST be in valid JSON format only, with no other text, like this: {\"priority\": number, \"rationale\": \"string\"}";
+
+            const payload = {
+                contents: [{ parts: [{ text: symptoms }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                }
+            };
+
+            try {
+                const result = await fetchWithBackoff(apiUrl, payload);
+                const candidate = result.candidates?.[0];
+
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    // The API response *is* the JSON string
+                    const jsonText = candidate.content.parts[0].text;
+                    const parsedData = JSON.parse(jsonText);
+                    
+                    if (typeof parsedData.priority === 'number' && typeof parsedData.rationale === 'string') {
+                        return parsedData;
+                    }
+                }
+                
+                throw new Error("Invalid response format from AI.");
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                throw new Error("Failed to analyze symptoms. Please try again.");
+            }
+        }
+
+        // --- 4. DOM & EVENT LISTENERS ---
+
+        /**
+         * Main function to handle the triage form submission.
+         */
+        async function handleTriageSubmit(event) {
+            event.preventDefault();
+            if (!isAuthReady) {
+                document.getElementById('api-message').innerHTML = `<div class="text-red-700 p-4 bg-red-100 rounded-lg">Please wait, connection not yet established.</div>`;
+                return;
+            }
+
+            const symptomsInput = document.getElementById('symptoms-input');
+            const submitButton = document.getElementById('submit-triage-btn');
+            const messageEl = document.getElementById('api-message');
+            const loadingEl = document.getElementById('loading-spinner');
+
+            const symptoms = symptomsInput.value.trim();
+            if (symptoms.length < 10) {
+                messageEl.innerHTML = `<div class="text-yellow-800 p-4 bg-yellow-100 rounded-lg">Please describe your symptoms in more detail.</div>`;
+                return;
+            }
+
+            // --- Show Loading State ---
+            submitButton.disabled = true;
+            submitButton.classList.add('opacity-50', 'cursor-not-allowed');
+            loadingEl.style.display = 'block';
+            messageEl.innerHTML = `<div class="text-blue-800 p-4 bg-blue-100 rounded-lg">Analyzing your symptoms...</div>`;
+
+            try {
+                // 1. Get priority from AI
+                const triageData = await getTriagePriority(symptoms);
+                const { priority, rationale } = triageData;
+
+                // 2. Display result to user
+                const priorityClass = getPriorityClass(priority);
+                messageEl.innerHTML = `
+                    <div class="p-4 rounded-lg shadow-md border ${priorityClass.border} ${priorityClass.bg}">
+                        <h4 class="font-bold text-lg ${priorityClass.text}">Triage Complete: ${getPriorityLabel(priority)} (Level ${priority})</h4>
+                        <p class="mt-1 text-gray-800"><strong>AI Rationale:</strong> ${rationale}</p>
+                        <p class="mt-2 text-sm text-gray-700">Your request has been added to the queue. A medical professional will review your case shortly.</p>
+                    </div>
+                `;
+
+                // 3. Save to Firestore (which will trigger the onSnapshot update)
+                await saveTriageRequest(symptoms, priority, rationale);
+                
+                symptomsInput.value = ''; // Clear form
+
+            } catch (error) {
+                console.error(error);
+                messageEl.innerHTML = `<div class="text-red-700 p-4 bg-red-100 rounded-lg">${error.message}</div>`;
+            } finally {
+                // --- Hide Loading State ---
+                submitButton.disabled = false;
+                submitButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                loadingEl.style.display = 'none';
+            }
+        }
+
+        // --- 5. UTILITY FUNCTIONS ---
+
+        function getPriorityClass(priority) {
+            switch (priority) {
+                case 5: return { text: 'text-red-700', border: 'border-red-500', bg: 'bg-red-50' }; // Critical
+                case 4: return { text: 'text-orange-700', border: 'border-orange-500', bg: 'bg-orange-50' }; // Severe
+                case 3: return { text: 'text-yellow-700', border: 'border-yellow-500', bg: 'bg-yellow-50' }; // Moderate
+                case 2: return { text: 'text-blue-700', border: 'border-blue-500', bg: 'bg-blue-50' }; // Mild
+                case 1: return { text: 'text-green-700', border: 'border-green-500', bg: 'bg-green-50' }; // Non-urgent
+                default: return { text: 'text-gray-700', border: 'border-gray-500', bg: 'bg-gray-50' };
+            }
+        }
+
+        function getPriorityLabel(priority) {
+            switch (priority) {
+                case 5: return 'Critical';
+                case 4: return 'Severe';
+                case 3: return 'Moderate';
+                case 2: return 'Mild';
+                case 1: return 'Non-urgent';
+                default: return 'Unknown';
+            }
+        }
+
+        // --- 6. INITIALIZATION ---
+        
+        // Setup event listeners once the DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            const triageForm = document.getElementById('triage-form');
+            if (triageForm) {
+                triageForm.addEventListener('submit', handleTriageSubmit);
+            }
+            // Dynamically create and render icons
+            lucide.createIcons();
+            
+            // Start the auth process
+            setupAuth();
+        });
+
+    </script>
+
+    <!-- Header -->
+    <header class="bg-white shadow-sm sticky top-0 z-50">
+        <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0 flex items-center">
+                    <i data-lucide="heart-pulse" class="h-8 w-8 text-blue-600"></i>
+                    <span class="font-bold text-2xl ml-2 text-blue-900">MediPrioritize</span>
+                </div>
+                <div class="hidden md:flex md:space-x-8">
+                    <a href="#home" class="font-medium text-gray-600 hover:text-blue-600">Home</a>
+                    <a href="#how-it-works" class="font-medium text-gray-600 hover:text-blue-600">How It Works</a>
+                    <a href="#submit-symptoms" class="font-medium text-gray-600 hover:text-blue-600">Submit Symptoms</a>
+                    <a href="#live-queue" class="font-medium text-gray-600 hover:text-blue-600">Live Queue</a>
+                </div>
+            </div>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main>
+        <!-- Hero Section -->
+        <section id="home" class="bg-blue-600 text-white">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 md:py-32 flex flex-col md:flex-row items-center">
+                <div class="md:w-1/2 text-center md:text-left">
+                    <h1 class="text-4xl md:text-5xl font-bold tracking-tight">
+                        Intelligent Medical Triage
+                    </h1>
+                    <p class="mt-4 text-xl text-blue-100">
+                        Get the right care, right when you need it. Our AI-powered system prioritizes patient needs 24/7.
+                    </p>
+                    <a href="#submit-symptoms" class="mt-8 inline-block bg-white text-blue-700 font-semibold px-8 py-3 rounded-lg shadow-lg hover:bg-gray-100 transition duration-300">
+                        <a href="#triageForm" class="mt-8 inline-block bg-white text-blue-700 font-semibold px-8 py-3 rounded-lg shadow-lg hover:bg-gray-100 transition duration-300">
+                        Check Symptoms Now
+                        </a>
+                    </a>
+                </div>
+                <div class="md:w-1/2 mt-10 md:mt-0 flex justify-center">
+                    <img src="https://placehold.co/500x400/FFFFFF/3B82F6?text=Calm+Clinical+Setting" 
+                         alt="Calm medical setting" 
+                         class="rounded-lg shadow-2xl"
+                         onerror="this.src='https://placehold.co/500x400/FFFFFF/3B82F6?text=Medical+Professional'">
+                </div>
+            </div>
+        </section>
+
+        <!-- How It Works Section -->
+        <section id="how-it-works" class="py-20 bg-white">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="text-center">
+                    <h2 class="text-3xl font-bold text-blue-900">How It Works</h2>
+                    <p class="mt-3 text-lg text-gray-600">A simple, 3-step process to get you prioritized.</p>
+                </div>
+                <div class="mt-16 grid gap-10 md:grid-cols-3">
+                    <!-- Step 1 -->
+                    <div class="text-center p-6 bg-gray-50 rounded-lg shadow-lg">
+                        <div class="flex items-center justify-center h-16 w-16 bg-blue-600 text-white rounded-full mx-auto">
+                            <i data-lucide="file-text" class="h-8 w-8"></i>
+                        </div>
+                        <h3 class="mt-5 text-xl font-semibold text-blue-900">1. Submit Symptoms</h3>
+                        <p class="mt-2 text-gray-600">Clearly describe your symptoms using our secure form. The more detail, the better.</p>
+                    </div>
+                    <!-- Step 2 -->
+                    <div class="text-center p-6 bg-gray-50 rounded-lg shadow-lg">
+                        <div class="flex items-center justify-center h-16 w-16 bg-blue-600 text-white rounded-full mx-auto">
+                            <i data-lucide="brain-circuit" class="h-8 w-8"></i>
+                        </div>
+                        <h3 class="mt-5 text-xl font-semibold text-blue-900">2. AI Analysis</h3>
+                        <p class="mt-2 text-gray-600">Our advanced AI analyzes your submission against medical data to assign a priority level.</p>
+                    </div>
+                    <!-- Step 3 -->
+                    <div class="text-center p-6 bg-gray-50 rounded-lg shadow-lg">
+                        <div class="flex items-center justify-center h-16 w-16 bg-blue-600 text-white rounded-full mx-auto">
+                            <i data-lucide="users" class="h-8 w-8"></i>
+                        </div>
+                        <h3 class="mt-5 text-xl font-semibold text-blue-900">3. Staff Review</h3>
+                        <p class="mt-2 text-gray-600">Your case appears in a prioritized queue for our medical staff to review and follow up.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Symptom Checker Section -->
+         <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Patient Triage Prioritization Tool</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+        }
+        .container {
+            max-width: 600px;
+            margin: auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+        }
+        label {
+            margin-top: 10px;
+            font-weight: bold;
+        }
+        input, select {
+            padding: 8px;
+            margin-top: 5px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        button {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #28a745;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #218838;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .priority-1 { color: #dc3545; }
+        .priority-2 { color: #fd7e14; }
+        .priority-3 { color: #ffc107; }
+        .priority-4 { color: #17a2b8; }
+        .priority-5 { color: #28a745; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Patient Triage Prioritization Tool</h1>
+        <p>This tool uses a simplified ESI to prioritize patients. Data is saved to the server.</p>
+        <form id="triageForm">
+            <label for="name">Patient Name:</label>
+            <input type="text" id="name" required>
+
+            <label for="age">Age:</label>
+            <input type="number" id="age" min="0" required>
+
+            <label for="chiefComplaint">Chief Complaint:</label>
+            <input type="text" id="chiefComplaint" required>
+
+            <label for="painLevel">Pain Level (0-10):</label>
+            <input type="number" id="painLevel" min="0" max="10" required>
+
+            <label for="consciousness">Level of Consciousness:</label>
+            <select id="consciousness" required>
+                <option value="">Select</option>
+                <option value="alert">Alert</option>
+                <option value="verbal">Responds to verbal stimuli</option>
+                <option value="pain">Responds to pain</option>
+                <option value="unresponsive">Unresponsive</option>
+            </select>
+
+            <label for="respiratoryRate">Respiratory Rate:</label>
+            <input type="number" id="respiratoryRate" min="0" required>
+
+            <label for="heartRate">Heart Rate:</label>
+            <input type="number" id="heartRate" min="0" required>
+
+            <label for="bloodPressure">Blood Pressure:</label>
+            <input type="text" id="bloodPressure" required>
+
+            <button type="submit">Submit and Calculate Priority</button>
+        </form>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        document.getElementById('triageForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const formData = {
+                name: document.getElementById('name').value,
+                age: parseInt(document.getElementById('age').value),
+                chiefComplaint: document.getElementById('chiefComplaint').value,
+                painLevel: parseInt(document.getElementById('painLevel').value),
+                consciousness: document.getElementById('consciousness').value,
+                respiratoryRate: parseInt(document.getElementById('respiratoryRate').value),
+                heartRate: parseInt(document.getElementById('heartRate').value),
+                bloodPressure: document.getElementById('bloodPressure').value
+            };
+
+            try {
+                const response = await fetch('/api/triage', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData)
+                });
+
+                const result = await response.json();
+                if (response.ok) {
+                    document.getElementById('result').innerHTML = `Priority Level: <span class="priority-${result.priority}">${result.priority}</span><br>Reason: ${result.reason}<br>Data saved successfully.`;
+                } else {
+                    document.getElementById('result').innerHTML = `Error: ${result.error}`;
+                }
+            } catch (error) {
+                document.getElementById('result').innerHTML = 'Network error. Please try again.';
+            }
+        });
+    </script>
+</body>
+</html>
+         
+        <section id="submit-symptoms" class="py-20 bg-gray-50">
+            <div class="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="bg-white p-8 md:p-12 rounded-lg shadow-2xl">
+                    <h2 class="text-3xl font-bold text-center text-blue-900">Symptom Checker</h2>
+                    <p class="mt-3 text-lg text-gray-600 text-center">
+                        Please describe your symptoms in detail below.
+                        <br>
+                        <strong class="text-red-600">If this is a life-threatening emergency, call 911.</strong>
+                    </p>
+                    <p id="patient-id-display" class="mt-4 text-center text-sm text-gray-500">Connecting to system...</p>
+
+                    <form id="triage-form" class="mt-8 space-y-6">
+                        <div>
+                            <label for="symptoms-input" class="block text-sm font-medium text-gray-700">Your Symptoms</label>
+                            <textarea id="symptoms-input" name="symptoms" rows="6" class="mt-1 block w-full border border-gray-300 rounded-lg shadow-sm p-3 focus:ring-blue-500 focus:border-blue-500" placeholder="e.g., 'I have a high fever, a persistent dry cough, and difficulty breathing. It started 3 days ago...'"></textarea>
+                        </div>
+                        
+                        <div class="flex items-center justify-between">
+                            <button id="submit-triage-btn" type="submit" class="w-full flex justify-center items-center px-6 py-3 border border-transparent text-base font-medium rounded-lg text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition duration-300">
+                                <i data-lucide="send" class="h-5 w-5 mr-2"></i>
+                                Submit for AI Triage
+                            </button>
+                        </div>
+                    </form>
+
+                    <!-- Loading and Message Area -->
+                    <div class="mt-6">
+                        <div id="loading-spinner" class="spinner mx-auto" style="display: none;"></div>
+                        <div id="api-message" class="mt-4"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Live Triage Queue Section -->
+        <section id="live-queue" class="py-20 bg-blue-50">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="text-center">
+                    <h2 class="text-3xl font-bold text-blue-900">Live Triage Queue (Staff View Demo)</h2>
+                    <p class="mt-3 text-lg text-gray-600">This list updates in real-time as new patients are prioritized by the AI.</p>
+                </div>
+
+                <div class="mt-12 bg-white rounded-lg shadow-xl overflow-hidden">
+                    <div class="px-6 py-4 bg-gray-100 border-b border-gray-200">
+                        <h3 class="text-lg font-semibold text-gray-800">Prioritized Patient List</h3>
+                    </div>
+                    <ul id="triage-queue-list" class="divide-y divide-gray-200 space-y-4 p-4">
+                        <!-- Triage items will be dynamically inserted here by JavaScript -->
+                        <li class="text-gray-500 p-4 text-center">Loading queue...</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-800 text-gray-300">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+            <div class="text-center">
+                <p>&copy; 2025 MediPrioritize. All rights reserved.</p>
+                <p class="mt-1 text-sm">This is a demonstration web application. Not for medical use.</p>
+            </div>
+        </div>
+    </footer>
+
+</body>
+</html>
